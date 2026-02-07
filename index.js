@@ -13,21 +13,28 @@ app.use(
   })
 );
 
+// =====================
+// ENVIRONMENT VARIABLES
+// =====================
 const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET;
 const N8N_RETURNS_WEBHOOK_URL = process.env.N8N_RETURNS_WEBHOOK_URL;
 
-// ✅ NEW: Shopify Admin token for refund endpoints
+// Optional fallback token (NOT required if you pass token per request)
 const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
 
-// Your shop domain (fixed as requested)
-const SHOPIFY_SHOP_DOMAIN = "311459-2.myshopify.com";
+// Optional default shop domain (if you don’t want to pass shopDomain each time)
+const SHOPIFY_SHOP_DOMAIN = process.env.SHOPIFY_SHOP_DOMAIN; // e.g. 311459-2.myshopify.com
 
-// Shopify REST API version (as you indicated)
-const SHOPIFY_API_VERSION = "2026-01";
+// Shopify Admin API version (you said 2026-01)
+const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2026-01";
 
+// =====================
+// HELPERS
+// =====================
 function verifyShopifyHmac(req) {
   const hmac = req.get("x-shopify-hmac-sha256");
   if (!hmac || !req.rawBody) return false;
+  if (!SHOPIFY_WEBHOOK_SECRET) return false;
 
   const digest = crypto
     .createHmac("sha256", SHOPIFY_WEBHOOK_SECRET)
@@ -37,9 +44,64 @@ function verifyShopifyHmac(req) {
   return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac));
 }
 
-// -------------------------
-// EXISTING WEBHOOK ENDPOINT
-// -------------------------
+function getShopifyAccessToken(req) {
+  const tokenFromHeader =
+    req.get("x-shopify-access-token") || req.get("X-Shopify-Access-Token");
+  const tokenFromBody = req.body?.shopifyAccessToken;
+  return tokenFromHeader || tokenFromBody || SHOPIFY_ADMIN_ACCESS_TOKEN;
+}
+
+async function shopifyAdminRequest({ shopDomain, accessToken, method, path, body }) {
+  const url = `https://${shopDomain}/admin/api/${SHOPIFY_API_VERSION}${path}`;
+
+  const response = await fetch(url, {
+    method,
+    headers: {
+      "X-Shopify-Access-Token": accessToken,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  const text = await response.text();
+  let json;
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch {
+    json = { raw: text };
+  }
+
+  if (!response.ok) {
+    const err = new Error(`Shopify Admin API error ${response.status}`);
+    err.status = response.status;
+    err.details = json;
+    throw err;
+  }
+
+  return json;
+}
+
+// =====================
+// ROUTES
+// =====================
+
+// Healthcheck
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    version: "shopify-proxy-webhooks+refunds-001",
+    hasWebhookSecret: Boolean(SHOPIFY_WEBHOOK_SECRET),
+    hasN8nWebhookUrl: Boolean(N8N_RETURNS_WEBHOOK_URL),
+    hasFallbackAdminToken: Boolean(SHOPIFY_ADMIN_ACCESS_TOKEN),
+    defaultShopDomain: SHOPIFY_SHOP_DOMAIN || null,
+    apiVersion: SHOPIFY_API_VERSION,
+  });
+});
+
+// ---------------------
+// Existing Webhooks endpoint (kept intact)
+// ---------------------
 app.post("/shopify/webhooks", async (req, res) => {
   if (!verifyShopifyHmac(req)) {
     return res.status(401).send("Invalid HMAC");
@@ -61,6 +123,11 @@ app.post("/shopify/webhooks", async (req, res) => {
 
   // Forward to n8n asynchronously
   try {
+    if (!N8N_RETURNS_WEBHOOK_URL) {
+      console.error("Missing env var N8N_RETURNS_WEBHOOK_URL");
+      return;
+    }
+
     await fetch(N8N_RETURNS_WEBHOOK_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -71,140 +138,166 @@ app.post("/shopify/webhooks", async (req, res) => {
   }
 });
 
-// =====================
-// ✅ NEW: REFUND HELPERS
-// =====================
-function assertRefundEnv(res) {
-  if (!SHOPIFY_ADMIN_ACCESS_TOKEN) {
-    res
-      .status(500)
-      .json({ error: "Missing env var SHOPIFY_ADMIN_ACCESS_TOKEN" });
-    return false;
-  }
-  return true;
-}
-
-async function shopifyAdminRequest({ method, path, body }) {
-  const url = `https://${SHOPIFY_SHOP_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}${path}`;
-
-  const resp = await fetch(url, {
-    method,
-    headers: {
-      "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-
-  const text = await resp.text();
-  let json;
-  try {
-    json = text ? JSON.parse(text) : {};
-  } catch {
-    json = { raw: text };
-  }
-
-  return { ok: resp.ok, status: resp.status, json };
-}
-
-function parseOrderId(reqBody) {
-  // Supports either order_id or orderId from n8n
-  const orderId = reqBody?.order_id ?? reqBody?.orderId;
-  if (!orderId || (typeof orderId !== "number" && typeof orderId !== "string")) {
-    return null;
-  }
-  return String(orderId).trim();
-}
-
-// ----------------------------------------
-// ✅ NEW (SAFE): Refund CALCULATE endpoint
-// ----------------------------------------
-// POST /shopify/refund/calculate
+// ---------------------
+// NEW: Create Refund
+// ---------------------
+// POST /shopify/refund?dryRun=true|false
 //
-// Expects body like:
+// Body format:
 // {
-//   "order_id": 12749945110905,
-//   "refund": { ... }   // Shopify refund calculate payload
+//   "shopDomain": "311459-2.myshopify.com",     // optional if env SHOPIFY_SHOP_DOMAIN set
+//   "orderId": 12749945110905,                  // REQUIRED
+//   "refund": { ... },                          // REQUIRED (Shopify refund object)
+//   "dryRun": true                              // optional alternative to query param
 // }
 //
-// OR:
-// {
-//   "orderId": "12749945110905",
-//   "refund": { ... }
-// }
-app.post("/shopify/refund/calculate", async (req, res) => {
-  if (!assertRefundEnv(res)) return;
-
-  const orderId = parseOrderId(req.body);
-  if (!orderId) {
-    return res.status(400).json({
-      error:
-        "Missing order_id (number/string) in request body. Provide order_id or orderId.",
-    });
-  }
-
-  const refund = req.body?.refund;
-  if (!refund || typeof refund !== "object" || Array.isArray(refund)) {
-    return res.status(400).json({
-      error:
-        "Missing refund object in request body. Provide { order_id, refund: { ... } }",
-    });
-  }
-
-  const { ok, status, json } = await shopifyAdminRequest({
-    method: "POST",
-    path: `/orders/${encodeURIComponent(orderId)}/refunds/calculate.json`,
-    body: { refund },
-  });
-
-  return res.status(status).json(json);
-});
-
-// ----------------------------------------
-// ✅ NEW (REAL): Refund CREATE endpoint
-// ----------------------------------------
-// POST /shopify/refund
+// Token sources (in order):
+// 1) Header: X-Shopify-Access-Token
+// 2) Body: shopifyAccessToken
+// 3) Env: SHOPIFY_ADMIN_ACCESS_TOKEN
 //
-// Expects body like:
-// {
-//   "order_id": 12749945110905,
-//   "refund": { ... }   // Shopify refund create payload
-// }
-//
-// OR:
-// {
-//   "orderId": "12749945110905",
-//   "refund": { ... }
-// }
 app.post("/shopify/refund", async (req, res) => {
-  if (!assertRefundEnv(res)) return;
+  try {
+    const dryRun =
+      String(req.query.dryRun || "").toLowerCase() === "true" ||
+      req.body?.dryRun === true;
 
-  const orderId = parseOrderId(req.body);
-  if (!orderId) {
-    return res.status(400).json({
-      error:
-        "Missing order_id (number/string) in request body. Provide order_id or orderId.",
+    const shopDomain = req.body?.shopDomain || SHOPIFY_SHOP_DOMAIN;
+    const orderId = req.body?.orderId;
+
+    // Expect refund object in body.refund
+    const refundObj = req.body?.refund;
+
+    const accessToken = getShopifyAccessToken(req);
+
+    if (!shopDomain) {
+      return res.status(400).json({ error: "Missing shopDomain" });
+    }
+    if (!orderId) {
+      return res.status(400).json({ error: "Missing orderId" });
+    }
+    if (!refundObj || typeof refundObj !== "object") {
+      return res.status(400).json({ error: "Missing refund object at body.refund" });
+    }
+    if (!accessToken) {
+      return res.status(500).json({
+        error:
+          "Missing Shopify access token. Provide header X-Shopify-Access-Token or body.shopifyAccessToken, or set SHOPIFY_ADMIN_ACCESS_TOKEN env var.",
+      });
+    }
+
+    const path = `/orders/${orderId}/refunds.json`;
+    const body = { refund: refundObj };
+
+    if (dryRun) {
+      return res.json({
+        ok: true,
+        dryRun: true,
+        wouldCall: {
+          method: "POST",
+          url: `https://${shopDomain}/admin/api/${SHOPIFY_API_VERSION}${path}`,
+          headers: {
+            "X-Shopify-Access-Token": "*****",
+            "Content-Type": "application/json",
+            Accept: "application/json",
+          },
+          body,
+        },
+      });
+    }
+
+    const result = await shopifyAdminRequest({
+      shopDomain,
+      accessToken,
+      method: "POST",
+      path,
+      body,
+    });
+
+    return res.json({ ok: true, result });
+  } catch (err) {
+    return res.status(err?.status || 500).json({
+      error: err?.message || String(err),
+      details: err?.details || null,
     });
   }
-
-  const refund = req.body?.refund;
-  if (!refund || typeof refund !== "object" || Array.isArray(refund)) {
-    return res.status(400).json({
-      error:
-        "Missing refund object in request body. Provide { order_id, refund: { ... } }",
-    });
-  }
-
-  const { ok, status, json } = await shopifyAdminRequest({
-    method: "POST",
-    path: `/orders/${encodeURIComponent(orderId)}/refunds.json`,
-    body: { refund },
-  });
-
-  return res.status(status).json(json);
 });
 
+// ---------------------
+// OPTIONAL: Calculate Refund (safe pre-check helper)
+// ---------------------
+// Shopify has a "calculate" endpoint on many versions:
+// POST /admin/api/{version}/orders/{order_id}/refunds/calculate.json
+//
+// Use this to verify amounts/line items before creating the real refund.
+// POST /shopify/refund/calculate?dryRun=true|false
+//
+app.post("/shopify/refund/calculate", async (req, res) => {
+  try {
+    const dryRun =
+      String(req.query.dryRun || "").toLowerCase() === "true" ||
+      req.body?.dryRun === true;
+
+    const shopDomain = req.body?.shopDomain || SHOPIFY_SHOP_DOMAIN;
+    const orderId = req.body?.orderId;
+
+    // This endpoint expects body.refund as well (Shopify convention)
+    const refundObj = req.body?.refund;
+
+    const accessToken = getShopifyAccessToken(req);
+
+    if (!shopDomain) return res.status(400).json({ error: "Missing shopDomain" });
+    if (!orderId) return res.status(400).json({ error: "Missing orderId" });
+    if (!refundObj || typeof refundObj !== "object") {
+      return res.status(400).json({ error: "Missing refund object at body.refund" });
+    }
+    if (!accessToken) {
+      return res.status(500).json({
+        error:
+          "Missing Shopify access token. Provide header X-Shopify-Access-Token or body.shopifyAccessToken, or set SHOPIFY_ADMIN_ACCESS_TOKEN env var.",
+      });
+    }
+
+    const path = `/orders/${orderId}/refunds/calculate.json`;
+    const body = { refund: refundObj };
+
+    if (dryRun) {
+      return res.json({
+        ok: true,
+        dryRun: true,
+        wouldCall: {
+          method: "POST",
+          url: `https://${shopDomain}/admin/api/${SHOPIFY_API_VERSION}${path}`,
+          headers: {
+            "X-Shopify-Access-Token": "*****",
+            "Content-Type": "application/json",
+            Accept: "application/json",
+          },
+          body,
+        },
+      });
+    }
+
+    const result = await shopifyAdminRequest({
+      shopDomain,
+      accessToken,
+      method: "POST",
+      path,
+      body,
+    });
+
+    return res.json({ ok: true, result });
+  } catch (err) {
+    return res.status(err?.status || 500).json({
+      error: err?.message || String(err),
+      details: err?.details || null,
+    });
+  }
+});
+
+// =====================
+// START SERVER
+// =====================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Shopify webhook proxy listening on ${PORT}`);
