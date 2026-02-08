@@ -25,7 +25,7 @@ const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
 // Optional default shop domain (if you don’t want to pass shopDomain each time)
 const SHOPIFY_SHOP_DOMAIN = process.env.SHOPIFY_SHOP_DOMAIN; // e.g. 311459-2.myshopify.com
 
-// Shopify Admin API version
+// Default Shopify Admin API version
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2026-01";
 
 // =====================
@@ -41,7 +41,11 @@ function verifyShopifyHmac(req) {
     .update(req.rawBody)
     .digest("base64");
 
-  return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac));
+  try {
+    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac));
+  } catch {
+    return false;
+  }
 }
 
 function getShopifyAccessToken(req) {
@@ -55,8 +59,21 @@ function getShopDomain(req) {
   return req.body?.shopDomain || SHOPIFY_SHOP_DOMAIN;
 }
 
-async function shopifyAdminRequest({ shopDomain, accessToken, method, path, body }) {
-  const url = `https://${shopDomain}/admin/api/${SHOPIFY_API_VERSION}${path}`;
+function getApiVersion(req) {
+  // Allow override per request (useful when one endpoint breaks on 2026-01)
+  return req.body?.apiVersion || req.query?.apiVersion || SHOPIFY_API_VERSION;
+}
+
+async function shopifyAdminRequest({
+  shopDomain,
+  accessToken,
+  method,
+  path,
+  body,
+  apiVersion,
+}) {
+  const version = apiVersion || SHOPIFY_API_VERSION;
+  const url = `https://${shopDomain}/admin/api/${version}${path}`;
 
   const response = await fetch(url, {
     method,
@@ -80,6 +97,7 @@ async function shopifyAdminRequest({ shopDomain, accessToken, method, path, body
     const err = new Error(`Shopify Admin API error ${response.status}`);
     err.status = response.status;
     err.details = json;
+    err.url = url;
     throw err;
   }
 
@@ -94,12 +112,12 @@ async function shopifyAdminRequest({ shopDomain, accessToken, method, path, body
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    version: "shopify-proxy-webhooks+refunds+fulfillments-002",
+    version: "shopify-proxy-webhooks+refunds+fulfillments-001",
     hasWebhookSecret: Boolean(SHOPIFY_WEBHOOK_SECRET),
     hasN8nWebhookUrl: Boolean(N8N_RETURNS_WEBHOOK_URL),
     hasFallbackAdminToken: Boolean(SHOPIFY_ADMIN_ACCESS_TOKEN),
     defaultShopDomain: SHOPIFY_SHOP_DOMAIN || null,
-    apiVersion: SHOPIFY_API_VERSION,
+    defaultApiVersion: SHOPIFY_API_VERSION,
   });
 });
 
@@ -143,87 +161,9 @@ app.post("/shopify/webhooks", async (req, res) => {
 });
 
 // ---------------------
-// Create Fulfillment (DIRECT EXECUTION, NO DRY RUN)
-// ---------------------
-// POST /shopify/fulfillments
-//
-// Body:
-// {
-//   "shopDomain": "311459-2.myshopify.com", // optional if env SHOPIFY_SHOP_DOMAIN set
-//   "shopifyAccessToken": "...",            // optional if header token or env token is used
-//   "fulfillment": {
-//     "message": "Shipped via Amazon MCF",
-//     "notify_customer": true,
-//     "tracking_info": { "number": "...", "company": "..." },
-//     "line_items_by_fulfillment_order": [{ "fulfillment_order_id": 123 }]
-//   }
-// }
-app.post("/shopify/fulfillments", async (req, res) => {
-  try {
-    const shopDomain = getShopDomain(req);
-    const accessToken = getShopifyAccessToken(req);
-
-    if (!shopDomain) {
-      return res.status(400).json({ error: "Missing shopDomain" });
-    }
-    if (!accessToken) {
-      return res.status(500).json({
-        error:
-          "Missing Shopify access token. Provide header X-Shopify-Access-Token or body.shopifyAccessToken, or set SHOPIFY_ADMIN_ACCESS_TOKEN env var.",
-      });
-    }
-    if (!req.body?.fulfillment || typeof req.body.fulfillment !== "object") {
-      return res.status(400).json({
-        error: "Invalid body: missing `fulfillment` object at body.fulfillment",
-      });
-    }
-
-    const loi = req.body.fulfillment.line_items_by_fulfillment_order;
-    if (!Array.isArray(loi) || loi.length === 0) {
-      return res.status(400).json({
-        error: "`line_items_by_fulfillment_order` must be a non-empty array.",
-      });
-    }
-
-    // Ensure fulfillment_order_id is numeric (Shopify expects number)
-    const fulfillmentOrderId = loi[0]?.fulfillment_order_id;
-    if (typeof fulfillmentOrderId !== "number") {
-      return res.status(400).json({
-        error: "`fulfillment_order_id` must be a NUMBER (not string).",
-        receivedType: typeof fulfillmentOrderId,
-        receivedValue: fulfillmentOrderId,
-      });
-    }
-
-    const result = await shopifyAdminRequest({
-      shopDomain,
-      accessToken,
-      method: "POST",
-      path: "/fulfillments.json",
-      body: { fulfillment: req.body.fulfillment },
-    });
-
-    return res.json({ ok: true, result });
-  } catch (err) {
-    return res.status(err?.status || 500).json({
-      error: err?.message || String(err),
-      details: err?.details || null,
-    });
-  }
-});
-
-// ---------------------
-// Create Refund (kept; supports dryRun)
+// Refunds (kept intact)
 // ---------------------
 // POST /shopify/refund?dryRun=true|false
-//
-// Body format:
-// {
-//   "shopDomain": "311459-2.myshopify.com",     // optional if env SHOPIFY_SHOP_DOMAIN set
-//   "orderId": 12749945110905,                  // REQUIRED
-//   "refund": { ... },                          // REQUIRED (Shopify refund object)
-//   "dryRun": true                              // optional alternative to query param
-// }
 app.post("/shopify/refund", async (req, res) => {
   try {
     const dryRun =
@@ -231,8 +171,10 @@ app.post("/shopify/refund", async (req, res) => {
       req.body?.dryRun === true;
 
     const shopDomain = getShopDomain(req);
+    const apiVersion = getApiVersion(req);
     const orderId = req.body?.orderId;
     const refundObj = req.body?.refund;
+
     const accessToken = getShopifyAccessToken(req);
 
     if (!shopDomain) return res.status(400).json({ error: "Missing shopDomain" });
@@ -256,7 +198,7 @@ app.post("/shopify/refund", async (req, res) => {
         dryRun: true,
         wouldCall: {
           method: "POST",
-          url: `https://${shopDomain}/admin/api/${SHOPIFY_API_VERSION}${path}`,
+          url: `https://${shopDomain}/admin/api/${apiVersion}${path}`,
           headers: {
             "X-Shopify-Access-Token": "*****",
             "Content-Type": "application/json",
@@ -273,6 +215,7 @@ app.post("/shopify/refund", async (req, res) => {
       method: "POST",
       path,
       body,
+      apiVersion,
     });
 
     return res.json({ ok: true, result });
@@ -280,13 +223,11 @@ app.post("/shopify/refund", async (req, res) => {
     return res.status(err?.status || 500).json({
       error: err?.message || String(err),
       details: err?.details || null,
+      url: err?.url || null,
     });
   }
 });
 
-// ---------------------
-// Calculate Refund (safe helper; supports dryRun)
-// ---------------------
 // POST /shopify/refund/calculate?dryRun=true|false
 app.post("/shopify/refund/calculate", async (req, res) => {
   try {
@@ -295,8 +236,10 @@ app.post("/shopify/refund/calculate", async (req, res) => {
       req.body?.dryRun === true;
 
     const shopDomain = getShopDomain(req);
+    const apiVersion = getApiVersion(req);
     const orderId = req.body?.orderId;
     const refundObj = req.body?.refund;
+
     const accessToken = getShopifyAccessToken(req);
 
     if (!shopDomain) return res.status(400).json({ error: "Missing shopDomain" });
@@ -320,7 +263,7 @@ app.post("/shopify/refund/calculate", async (req, res) => {
         dryRun: true,
         wouldCall: {
           method: "POST",
-          url: `https://${shopDomain}/admin/api/${SHOPIFY_API_VERSION}${path}`,
+          url: `https://${shopDomain}/admin/api/${apiVersion}${path}`,
           headers: {
             "X-Shopify-Access-Token": "*****",
             "Content-Type": "application/json",
@@ -337,6 +280,7 @@ app.post("/shopify/refund/calculate", async (req, res) => {
       method: "POST",
       path,
       body,
+      apiVersion,
     });
 
     return res.json({ ok: true, result });
@@ -344,6 +288,72 @@ app.post("/shopify/refund/calculate", async (req, res) => {
     return res.status(err?.status || 500).json({
       error: err?.message || String(err),
       details: err?.details || null,
+      url: err?.url || null,
+    });
+  }
+});
+
+// ---------------------
+// NEW: Create Fulfillment (NO DRY RUN)
+// ---------------------
+// This matches your exact desired Shopify endpoint + body style.
+// POST /shopify/fulfillments/create
+//
+// Body:
+// {
+//   "shopDomain": "311459-2.myshopify.com",     // optional if env set
+//   "apiVersion": "2025-10",                    // optional override (RECOMMENDED if 2026-01 returns 404)
+//   "fulfillment": { ... }                      // REQUIRED, exact payload you want to send to Shopify
+// }
+//
+// Token sources (in order):
+// 1) Header: X-Shopify-Access-Token
+// 2) Body: shopifyAccessToken
+// 3) Env: SHOPIFY_ADMIN_ACCESS_TOKEN
+//
+app.post("/shopify/fulfillments/create", async (req, res) => {
+  try {
+    const shopDomain = getShopDomain(req);
+    const apiVersion = getApiVersion(req);
+    const accessToken = getShopifyAccessToken(req);
+
+    const fulfillment = req.body?.fulfillment;
+
+    if (!shopDomain) return res.status(400).json({ error: "Missing shopDomain" });
+    if (!accessToken) {
+      return res.status(500).json({
+        error:
+          "Missing Shopify access token. Provide header X-Shopify-Access-Token or body.shopifyAccessToken, or set SHOPIFY_ADMIN_ACCESS_TOKEN env var.",
+      });
+    }
+    if (!fulfillment || typeof fulfillment !== "object") {
+      return res
+        .status(400)
+        .json({ error: "Missing fulfillment object at body.fulfillment" });
+    }
+
+    const path = `/fulfillments.json`;
+    const body = { fulfillment };
+
+    const result = await shopifyAdminRequest({
+      shopDomain,
+      accessToken,
+      method: "POST",
+      path,
+      body,
+      apiVersion,
+    });
+
+    return res.json({ ok: true, result });
+  } catch (err) {
+    return res.status(err?.status || 500).json({
+      error: err?.message || String(err),
+      details: err?.details || null,
+      url: err?.url || null,
+      hint:
+        err?.status === 404
+          ? "Shopify returned 404. Try sending apiVersion='2025-10' in the request body for this endpoint."
+          : null,
     });
   }
 });
