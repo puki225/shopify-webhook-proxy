@@ -25,7 +25,7 @@ const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
 // Optional default shop domain (if you don’t want to pass shopDomain each time)
 const SHOPIFY_SHOP_DOMAIN = process.env.SHOPIFY_SHOP_DOMAIN; // e.g. 311459-2.myshopify.com
 
-// Shopify Admin API version (you said 2026-01)
+// Shopify Admin API version
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2026-01";
 
 // =====================
@@ -49,6 +49,10 @@ function getShopifyAccessToken(req) {
     req.get("x-shopify-access-token") || req.get("X-Shopify-Access-Token");
   const tokenFromBody = req.body?.shopifyAccessToken;
   return tokenFromHeader || tokenFromBody || SHOPIFY_ADMIN_ACCESS_TOKEN;
+}
+
+function getShopDomain(req) {
+  return req.body?.shopDomain || SHOPIFY_SHOP_DOMAIN;
 }
 
 async function shopifyAdminRequest({ shopDomain, accessToken, method, path, body }) {
@@ -90,7 +94,7 @@ async function shopifyAdminRequest({ shopDomain, accessToken, method, path, body
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    version: "shopify-proxy-webhooks+refunds-001",
+    version: "shopify-proxy-webhooks+refunds+fulfillments-002",
     hasWebhookSecret: Boolean(SHOPIFY_WEBHOOK_SECRET),
     hasN8nWebhookUrl: Boolean(N8N_RETURNS_WEBHOOK_URL),
     hasFallbackAdminToken: Boolean(SHOPIFY_ADMIN_ACCESS_TOKEN),
@@ -139,7 +143,77 @@ app.post("/shopify/webhooks", async (req, res) => {
 });
 
 // ---------------------
-// NEW: Create Refund
+// Create Fulfillment (DIRECT EXECUTION, NO DRY RUN)
+// ---------------------
+// POST /shopify/fulfillments
+//
+// Body:
+// {
+//   "shopDomain": "311459-2.myshopify.com", // optional if env SHOPIFY_SHOP_DOMAIN set
+//   "shopifyAccessToken": "...",            // optional if header token or env token is used
+//   "fulfillment": {
+//     "message": "Shipped via Amazon MCF",
+//     "notify_customer": true,
+//     "tracking_info": { "number": "...", "company": "..." },
+//     "line_items_by_fulfillment_order": [{ "fulfillment_order_id": 123 }]
+//   }
+// }
+app.post("/shopify/fulfillments", async (req, res) => {
+  try {
+    const shopDomain = getShopDomain(req);
+    const accessToken = getShopifyAccessToken(req);
+
+    if (!shopDomain) {
+      return res.status(400).json({ error: "Missing shopDomain" });
+    }
+    if (!accessToken) {
+      return res.status(500).json({
+        error:
+          "Missing Shopify access token. Provide header X-Shopify-Access-Token or body.shopifyAccessToken, or set SHOPIFY_ADMIN_ACCESS_TOKEN env var.",
+      });
+    }
+    if (!req.body?.fulfillment || typeof req.body.fulfillment !== "object") {
+      return res.status(400).json({
+        error: "Invalid body: missing `fulfillment` object at body.fulfillment",
+      });
+    }
+
+    const loi = req.body.fulfillment.line_items_by_fulfillment_order;
+    if (!Array.isArray(loi) || loi.length === 0) {
+      return res.status(400).json({
+        error: "`line_items_by_fulfillment_order` must be a non-empty array.",
+      });
+    }
+
+    // Ensure fulfillment_order_id is numeric (Shopify expects number)
+    const fulfillmentOrderId = loi[0]?.fulfillment_order_id;
+    if (typeof fulfillmentOrderId !== "number") {
+      return res.status(400).json({
+        error: "`fulfillment_order_id` must be a NUMBER (not string).",
+        receivedType: typeof fulfillmentOrderId,
+        receivedValue: fulfillmentOrderId,
+      });
+    }
+
+    const result = await shopifyAdminRequest({
+      shopDomain,
+      accessToken,
+      method: "POST",
+      path: "/fulfillments.json",
+      body: { fulfillment: req.body.fulfillment },
+    });
+
+    return res.json({ ok: true, result });
+  } catch (err) {
+    return res.status(err?.status || 500).json({
+      error: err?.message || String(err),
+      details: err?.details || null,
+    });
+  }
+});
+
+// ---------------------
+// Create Refund (kept; supports dryRun)
 // ---------------------
 // POST /shopify/refund?dryRun=true|false
 //
@@ -150,32 +224,19 @@ app.post("/shopify/webhooks", async (req, res) => {
 //   "refund": { ... },                          // REQUIRED (Shopify refund object)
 //   "dryRun": true                              // optional alternative to query param
 // }
-//
-// Token sources (in order):
-// 1) Header: X-Shopify-Access-Token
-// 2) Body: shopifyAccessToken
-// 3) Env: SHOPIFY_ADMIN_ACCESS_TOKEN
-//
 app.post("/shopify/refund", async (req, res) => {
   try {
     const dryRun =
       String(req.query.dryRun || "").toLowerCase() === "true" ||
       req.body?.dryRun === true;
 
-    const shopDomain = req.body?.shopDomain || SHOPIFY_SHOP_DOMAIN;
+    const shopDomain = getShopDomain(req);
     const orderId = req.body?.orderId;
-
-    // Expect refund object in body.refund
     const refundObj = req.body?.refund;
-
     const accessToken = getShopifyAccessToken(req);
 
-    if (!shopDomain) {
-      return res.status(400).json({ error: "Missing shopDomain" });
-    }
-    if (!orderId) {
-      return res.status(400).json({ error: "Missing orderId" });
-    }
+    if (!shopDomain) return res.status(400).json({ error: "Missing shopDomain" });
+    if (!orderId) return res.status(400).json({ error: "Missing orderId" });
     if (!refundObj || typeof refundObj !== "object") {
       return res.status(400).json({ error: "Missing refund object at body.refund" });
     }
@@ -224,26 +285,18 @@ app.post("/shopify/refund", async (req, res) => {
 });
 
 // ---------------------
-// OPTIONAL: Calculate Refund (safe pre-check helper)
+// Calculate Refund (safe helper; supports dryRun)
 // ---------------------
-// Shopify has a "calculate" endpoint on many versions:
-// POST /admin/api/{version}/orders/{order_id}/refunds/calculate.json
-//
-// Use this to verify amounts/line items before creating the real refund.
 // POST /shopify/refund/calculate?dryRun=true|false
-//
 app.post("/shopify/refund/calculate", async (req, res) => {
   try {
     const dryRun =
       String(req.query.dryRun || "").toLowerCase() === "true" ||
       req.body?.dryRun === true;
 
-    const shopDomain = req.body?.shopDomain || SHOPIFY_SHOP_DOMAIN;
+    const shopDomain = getShopDomain(req);
     const orderId = req.body?.orderId;
-
-    // This endpoint expects body.refund as well (Shopify convention)
     const refundObj = req.body?.refund;
-
     const accessToken = getShopifyAccessToken(req);
 
     if (!shopDomain) return res.status(400).json({ error: "Missing shopDomain" });
