@@ -104,6 +104,73 @@ async function shopifyAdminRequest({
   return json;
 }
 
+/**
+ * NEW helper (refund component only): fetch refundable line items (ids + qty)
+ * We only need line_items for building refund_line_items.
+ */
+async function getOrderLineItems({ shopDomain, accessToken, orderId, apiVersion }) {
+  const data = await shopifyAdminRequest({
+    shopDomain,
+    accessToken,
+    method: "GET",
+    path: `/orders/${orderId}.json?fields=line_items`,
+    body: null,
+    apiVersion,
+  });
+
+  return data?.order?.line_items || [];
+}
+
+/**
+ * NEW helper (refund component only): determine if refundObj already contains
+ * one of the required refund components Shopify demands.
+ */
+function hasShopifyRefundPayload(refundObj) {
+  if (!refundObj || typeof refundObj !== "object") return false;
+
+  const hasArray = (k) => Array.isArray(refundObj[k]) && refundObj[k].length > 0;
+
+  return (
+    hasArray("refund_line_items") ||
+    hasArray("refund_duties") ||
+    hasArray("transactions") ||
+    hasArray("refund_methods") ||
+    hasArray("order_adjustments")
+  );
+}
+
+/**
+ * NEW helper (refund component only): build full refund_line_items for the order
+ * Default behavior: do NOT restock unless caller explicitly requests.
+ * Caller can pass refundObj.restock === true OR refundObj.restock_type.
+ */
+function buildFullRefundLineItems(lineItems, refundObj) {
+  const restockType =
+    typeof refundObj?.restock_type === "string"
+      ? refundObj.restock_type
+      : refundObj?.restock === true
+        ? "return"
+        : "no_restock";
+
+  return (lineItems || [])
+    .filter((li) => li?.id && Number(li?.quantity) > 0)
+    .map((li) => ({
+      line_item_id: li.id,
+      quantity: li.quantity,
+      restock_type: restockType,
+    }));
+}
+
+/**
+ * NEW helper (refund component only): normalize calculate response shape
+ * (Shopify responses sometimes nest under { refund: {...} })
+ */
+function extractCalculatedRefund(calcResponse) {
+  if (!calcResponse) return null;
+  if (calcResponse.refund && typeof calcResponse.refund === "object") return calcResponse.refund;
+  return calcResponse;
+}
+
 // =====================
 // ROUTES
 // =====================
@@ -161,9 +228,20 @@ app.post("/shopify/webhooks", async (req, res) => {
 });
 
 // ---------------------
-// Refunds (kept intact)
+// Refunds (UPDATED ONLY HERE, everything else unchanged)
 // ---------------------
 // POST /shopify/refund?dryRun=true|false
+//
+// Works with your current n8n payload that only sends:
+// { refund: { note, notify } }
+//
+// Behavior:
+// - If caller already provides refund_line_items / transactions / etc. => forward as-is.
+// - Otherwise => AUTO flow:
+//   1) GET order line_items
+//   2) POST refunds/calculate.json with full refund_line_items
+//   3) POST refunds.json with same refund_line_items + calculated transactions
+//
 app.post("/shopify/refund", async (req, res) => {
   try {
     const dryRun =
@@ -189,36 +267,153 @@ app.post("/shopify/refund", async (req, res) => {
       });
     }
 
-    const path = `/orders/${orderId}/refunds.json`;
-    const body = { refund: refundObj };
+    // If the user already sends a valid Shopify refund payload, just forward it.
+    if (hasShopifyRefundPayload(refundObj)) {
+      const path = `/orders/${orderId}/refunds.json`;
+      const body = { refund: refundObj };
 
-    if (dryRun) {
-      return res.json({
-        ok: true,
-        dryRun: true,
-        wouldCall: {
-          method: "POST",
-          url: `https://${shopDomain}/admin/api/${apiVersion}${path}`,
-          headers: {
-            "X-Shopify-Access-Token": "*****",
-            "Content-Type": "application/json",
-            Accept: "application/json",
+      if (dryRun) {
+        return res.json({
+          ok: true,
+          dryRun: true,
+          mode: "forward",
+          wouldCall: {
+            method: "POST",
+            url: `https://${shopDomain}/admin/api/${apiVersion}${path}`,
+            headers: {
+              "X-Shopify-Access-Token": "*****",
+              "Content-Type": "application/json",
+              Accept: "application/json",
+            },
+            body,
           },
-          body,
-        },
+        });
+      }
+
+      const result = await shopifyAdminRequest({
+        shopDomain,
+        accessToken,
+        method: "POST",
+        path,
+        body,
+        apiVersion,
       });
+
+      return res.json({ ok: true, mode: "forward", result });
     }
 
-    const result = await shopifyAdminRequest({
+    // AUTO flow for your current n8n setup (note/notify only)
+    const lineItems = await getOrderLineItems({
       shopDomain,
       accessToken,
-      method: "POST",
-      path,
-      body,
+      orderId,
       apiVersion,
     });
 
-    return res.json({ ok: true, result });
+    if (!lineItems.length) {
+      return res.status(422).json({
+        error: "Cannot auto-refund: order has no line items.",
+        hint: "Provide refund.transactions (money-only refund) or refund_line_items explicitly.",
+      });
+    }
+
+    const refundLineItems = buildFullRefundLineItems(lineItems, refundObj);
+
+    // 1) calculate
+    const calcPath = `/orders/${orderId}/refunds/calculate.json`;
+
+    // IMPORTANT: Do not pass transactions to calculate unless you really mean to override.
+    // We'll let Shopify compute correct refund transactions.
+    const calcBody = {
+      refund: {
+        ...refundObj,
+        refund_line_items: refundLineItems,
+      },
+    };
+
+    if (dryRun) {
+      // In dryRun we show both calls that would be made.
+      return res.json({
+        ok: true,
+        dryRun: true,
+        mode: "auto",
+        wouldCall: [
+          {
+            step: "calculate",
+            method: "POST",
+            url: `https://${shopDomain}/admin/api/${apiVersion}${calcPath}`,
+            headers: {
+              "X-Shopify-Access-Token": "*****",
+              "Content-Type": "application/json",
+              Accept: "application/json",
+            },
+            body: calcBody,
+          },
+          {
+            step: "create",
+            method: "POST",
+            url: `https://${shopDomain}/admin/api/${apiVersion}/orders/${orderId}/refunds.json`,
+            headers: {
+              "X-Shopify-Access-Token": "*****",
+              "Content-Type": "application/json",
+              Accept: "application/json",
+            },
+            body: {
+              refund: {
+                ...refundObj,
+                refund_line_items: refundLineItems,
+                transactions: "<from calculate response>",
+              },
+            },
+          },
+        ],
+      });
+    }
+
+    const calcResult = await shopifyAdminRequest({
+      shopDomain,
+      accessToken,
+      method: "POST",
+      path: calcPath,
+      body: calcBody,
+      apiVersion,
+    });
+
+    const calcRefund = extractCalculatedRefund(calcResult);
+    const calculatedTransactions =
+      (calcRefund && Array.isArray(calcRefund.transactions) && calcRefund.transactions) || [];
+
+    // If Shopify doesn't return transactions, creating may fail.
+    // We'll attempt create without transactions as a fallback, but return a clear error if Shopify rejects it.
+    const createPath = `/orders/${orderId}/refunds.json`;
+
+    const createRefundObj = {
+      ...refundObj,
+      refund_line_items: refundLineItems,
+      ...(calculatedTransactions.length ? { transactions: calculatedTransactions } : {}),
+    };
+
+    const createBody = { refund: createRefundObj };
+
+    const createResult = await shopifyAdminRequest({
+      shopDomain,
+      accessToken,
+      method: "POST",
+      path: createPath,
+      body: createBody,
+      apiVersion,
+    });
+
+    return res.json({
+      ok: true,
+      mode: "auto",
+      calculate: calcResult,
+      result: createResult,
+      note:
+        calculatedTransactions.length === 0
+          ? "Shopify calculate response contained no transactions; create was attempted without transactions."
+          : undefined,
+    });
   } catch (err) {
     return res.status(err?.status || 500).json({
       error: err?.message || String(err),
@@ -229,6 +424,7 @@ app.post("/shopify/refund", async (req, res) => {
 });
 
 // POST /shopify/refund/calculate?dryRun=true|false
+// (kept intact)
 app.post("/shopify/refund/calculate", async (req, res) => {
   try {
     const dryRun =
