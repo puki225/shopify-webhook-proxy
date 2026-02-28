@@ -104,10 +104,9 @@ async function shopifyAdminRequest({
   return json;
 }
 
-/**
- * NEW helper (refund component only): fetch refundable line items (ids + qty)
- * We only need line_items for building refund_line_items.
- */
+// =====================
+// REFUND HELPERS (NEW — only affects refund component)
+// =====================
 async function getOrderLineItems({ shopDomain, accessToken, orderId, apiVersion }) {
   const data = await shopifyAdminRequest({
     shopDomain,
@@ -121,15 +120,22 @@ async function getOrderLineItems({ shopDomain, accessToken, orderId, apiVersion 
   return data?.order?.line_items || [];
 }
 
-/**
- * NEW helper (refund component only): determine if refundObj already contains
- * one of the required refund components Shopify demands.
- */
+async function getOrderTransactions({ shopDomain, accessToken, orderId, apiVersion }) {
+  const data = await shopifyAdminRequest({
+    shopDomain,
+    accessToken,
+    method: "GET",
+    path: `/orders/${orderId}/transactions.json`,
+    body: null,
+    apiVersion,
+  });
+
+  return data?.transactions || [];
+}
+
 function hasShopifyRefundPayload(refundObj) {
   if (!refundObj || typeof refundObj !== "object") return false;
-
   const hasArray = (k) => Array.isArray(refundObj[k]) && refundObj[k].length > 0;
-
   return (
     hasArray("refund_line_items") ||
     hasArray("refund_duties") ||
@@ -139,11 +145,6 @@ function hasShopifyRefundPayload(refundObj) {
   );
 }
 
-/**
- * NEW helper (refund component only): build full refund_line_items for the order
- * Default behavior: do NOT restock unless caller explicitly requests.
- * Caller can pass refundObj.restock === true OR refundObj.restock_type.
- */
 function buildFullRefundLineItems(lineItems, refundObj) {
   const restockType =
     typeof refundObj?.restock_type === "string"
@@ -161,14 +162,58 @@ function buildFullRefundLineItems(lineItems, refundObj) {
     }));
 }
 
-/**
- * NEW helper (refund component only): normalize calculate response shape
- * (Shopify responses sometimes nest under { refund: {...} })
- */
 function extractCalculatedRefund(calcResponse) {
   if (!calcResponse) return null;
   if (calcResponse.refund && typeof calcResponse.refund === "object") return calcResponse.refund;
   return calcResponse;
+}
+
+/**
+ * Convert calculate transactions into valid create-refund transactions.
+ * - suggested_refund -> refund
+ * - keep only safe/expected fields
+ * - ensure parent_id if possible
+ */
+function normalizeRefundTransactions(calculatedTransactions, fallbackParent) {
+  const txs = Array.isArray(calculatedTransactions) ? calculatedTransactions : [];
+
+  return txs
+    .map((t) => {
+      const kind = t.kind === "suggested_refund" ? "refund" : t.kind;
+
+      // Keep only fields that Shopify accepts/needs.
+      const out = {
+        kind,
+        amount: t.amount,
+      };
+
+      if (t.gateway) out.gateway = t.gateway;
+      if (t.currency) out.currency = t.currency;
+
+      // parent_id is commonly required for card gateways
+      const parent_id = t.parent_id || fallbackParent || undefined;
+      if (parent_id) out.parent_id = parent_id;
+
+      // Some calculate responses include "authorization" etc; include if present.
+      if (t.authorization) out.authorization = t.authorization;
+
+      return out;
+    })
+    // only keep actual refund transactions
+    .filter((t) => t.kind === "refund" && t.amount);
+}
+
+function pickRefundParentTransactionId(orderTransactions) {
+  // Prefer a captured/sale transaction as the parent
+  const txs = Array.isArray(orderTransactions) ? orderTransactions : [];
+
+  const preferred = txs.find(
+    (t) =>
+      (t.kind === "sale" || t.kind === "capture") &&
+      (t.status === "success" || t.status === "pending")
+  );
+
+  return preferred?.id || null;
 }
 
 // =====================
@@ -228,20 +273,9 @@ app.post("/shopify/webhooks", async (req, res) => {
 });
 
 // ---------------------
-// Refunds (UPDATED ONLY HERE, everything else unchanged)
+// Refunds (UPDATED ONLY HERE)
 // ---------------------
 // POST /shopify/refund?dryRun=true|false
-//
-// Works with your current n8n payload that only sends:
-// { refund: { note, notify } }
-//
-// Behavior:
-// - If caller already provides refund_line_items / transactions / etc. => forward as-is.
-// - Otherwise => AUTO flow:
-//   1) GET order line_items
-//   2) POST refunds/calculate.json with full refund_line_items
-//   3) POST refunds.json with same refund_line_items + calculated transactions
-//
 app.post("/shopify/refund", async (req, res) => {
   try {
     const dryRun =
@@ -267,9 +301,10 @@ app.post("/shopify/refund", async (req, res) => {
       });
     }
 
-    // If the user already sends a valid Shopify refund payload, just forward it.
+    const createPath = `/orders/${orderId}/refunds.json`;
+
+    // If caller already provides a complete refund payload, forward as-is.
     if (hasShopifyRefundPayload(refundObj)) {
-      const path = `/orders/${orderId}/refunds.json`;
       const body = { refund: refundObj };
 
       if (dryRun) {
@@ -279,7 +314,7 @@ app.post("/shopify/refund", async (req, res) => {
           mode: "forward",
           wouldCall: {
             method: "POST",
-            url: `https://${shopDomain}/admin/api/${apiVersion}${path}`,
+            url: `https://${shopDomain}/admin/api/${apiVersion}${createPath}`,
             headers: {
               "X-Shopify-Access-Token": "*****",
               "Content-Type": "application/json",
@@ -294,7 +329,7 @@ app.post("/shopify/refund", async (req, res) => {
         shopDomain,
         accessToken,
         method: "POST",
-        path,
+        path: createPath,
         body,
         apiVersion,
       });
@@ -302,7 +337,8 @@ app.post("/shopify/refund", async (req, res) => {
       return res.json({ ok: true, mode: "forward", result });
     }
 
-    // AUTO flow for your current n8n setup (note/notify only)
+    // AUTO flow for your current n8n setup (note/notify only):
+    // 1) Get line items
     const lineItems = await getOrderLineItems({
       shopDomain,
       accessToken,
@@ -319,11 +355,8 @@ app.post("/shopify/refund", async (req, res) => {
 
     const refundLineItems = buildFullRefundLineItems(lineItems, refundObj);
 
-    // 1) calculate
+    // 2) Calculate
     const calcPath = `/orders/${orderId}/refunds/calculate.json`;
-
-    // IMPORTANT: Do not pass transactions to calculate unless you really mean to override.
-    // We'll let Shopify compute correct refund transactions.
     const calcBody = {
       refund: {
         ...refundObj,
@@ -332,7 +365,6 @@ app.post("/shopify/refund", async (req, res) => {
     };
 
     if (dryRun) {
-      // In dryRun we show both calls that would be made.
       return res.json({
         ok: true,
         dryRun: true,
@@ -352,7 +384,7 @@ app.post("/shopify/refund", async (req, res) => {
           {
             step: "create",
             method: "POST",
-            url: `https://${shopDomain}/admin/api/${apiVersion}/orders/${orderId}/refunds.json`,
+            url: `https://${shopDomain}/admin/api/${apiVersion}${createPath}`,
             headers: {
               "X-Shopify-Access-Token": "*****",
               "Content-Type": "application/json",
@@ -362,7 +394,7 @@ app.post("/shopify/refund", async (req, res) => {
               refund: {
                 ...refundObj,
                 refund_line_items: refundLineItems,
-                transactions: "<from calculate response>",
+                transactions: "<normalized from calculate>",
               },
             },
           },
@@ -380,22 +412,32 @@ app.post("/shopify/refund", async (req, res) => {
     });
 
     const calcRefund = extractCalculatedRefund(calcResult);
-    const calculatedTransactions =
-      (calcRefund && Array.isArray(calcRefund.transactions) && calcRefund.transactions) || [];
+    const calculatedTransactions = calcRefund?.transactions || [];
 
-    // If Shopify doesn't return transactions, creating may fail.
-    // We'll attempt create without transactions as a fallback, but return a clear error if Shopify rejects it.
-    const createPath = `/orders/${orderId}/refunds.json`;
+    // 3) Ensure we have a parent transaction id if needed
+    const orderTxs = await getOrderTransactions({
+      shopDomain,
+      accessToken,
+      orderId,
+      apiVersion,
+    });
+    const fallbackParentId = pickRefundParentTransactionId(orderTxs);
 
-    const createRefundObj = {
-      ...refundObj,
-      refund_line_items: refundLineItems,
-      ...(calculatedTransactions.length ? { transactions: calculatedTransactions } : {}),
+    // 4) Normalize suggested_refund -> refund
+    const normalizedTransactions = normalizeRefundTransactions(
+      calculatedTransactions,
+      fallbackParentId
+    );
+
+    const createBody = {
+      refund: {
+        ...refundObj,
+        refund_line_items: refundLineItems,
+        transactions: normalizedTransactions,
+      },
     };
 
-    const createBody = { refund: createRefundObj };
-
-    const createResult = await shopifyAdminRequest({
+    const result = await shopifyAdminRequest({
       shopDomain,
       accessToken,
       method: "POST",
@@ -408,11 +450,7 @@ app.post("/shopify/refund", async (req, res) => {
       ok: true,
       mode: "auto",
       calculate: calcResult,
-      result: createResult,
-      note:
-        calculatedTransactions.length === 0
-          ? "Shopify calculate response contained no transactions; create was attempted without transactions."
-          : undefined,
+      result,
     });
   } catch (err) {
     return res.status(err?.status || 500).json({
@@ -492,21 +530,6 @@ app.post("/shopify/refund/calculate", async (req, res) => {
 // ---------------------
 // NEW: Create Fulfillment (NO DRY RUN)
 // ---------------------
-// This matches your exact desired Shopify endpoint + body style.
-// POST /shopify/fulfillments/create
-//
-// Body:
-// {
-//   "shopDomain": "311459-2.myshopify.com",     // optional if env set
-//   "apiVersion": "2025-10",                    // optional override (RECOMMENDED if 2026-01 returns 404)
-//   "fulfillment": { ... }                      // REQUIRED, exact payload you want to send to Shopify
-// }
-//
-// Token sources (in order):
-// 1) Header: X-Shopify-Access-Token
-// 2) Body: shopifyAccessToken
-// 3) Env: SHOPIFY_ADMIN_ACCESS_TOKEN
-//
 app.post("/shopify/fulfillments/create", async (req, res) => {
   try {
     const shopDomain = getShopDomain(req);
